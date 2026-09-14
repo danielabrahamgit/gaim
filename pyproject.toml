@@ -1,0 +1,27 @@
+[build-system]
+requires = [
+   "setuptools",
+   "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gaim"
+version = "0.0.1"
+authors = [
+  { name="Daniel Abraham", email="abrahamd@stanford.edu" },
+]
+description = "Generalized Auto-Focus for Imperfect Models in MRI (GAIM)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch",
+    "numpy",
+    "tqdm",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

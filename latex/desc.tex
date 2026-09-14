@@ -1,0 +1,59 @@
+\documentclass{article}
+\usepackage{graphicx} % Required for inserting images
+\usepackage{amsmath}
+
+\title{Generalized Auto-Focus for Imperfect Models in MRI (GAIM)}
+\author{Daniel Raz Abraham}
+\date{September 2026}
+
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator*{\argmax}{arg\,max}
+\newcommand{\x}{\mathbf{x}}
+\newcommand{\A}{\mathbf{A}}
+\renewcommand{\b}{\mathbf{b}}
+\newcommand{\params}{\boldsymbol{\theta}}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+The classical compressed sensing (CS) regime used simple and predictable forward models conjunction with strong image priors to reconstruct missing data from incoherently under-sampled measurements. Although CS provides drastic acceleration, using image priors to fill in missing information is fundamentally limited by the tightness of the image domain prior. Furthermore, much of the techniques to incorporate image priors can hallucinate false structures that are not present in the real images.
+
+Alternatively, one could instead use aggressive and less predictable forward models that efficiently and sufficiently sample k-space. Since these forward models require operating at the scanner limits, image artifacts arise not from under-sampling, but rather from model imperfections that must be calibrated. If properly calibrated, such imaging models can encode enough imaging data in a very short amount of time. However, the crux of these techniques is in the difficulty of calibrating forward models. This has been a more or less open problem for the past few decades, and continues as an active area of research. While techniques are improving to calibrate these model imperfection parameters up front, there are no strong guarantees on the accuracy of these estimates or how stable they will be across subjects. 
+
+To address this, we explore a hybrid approach which still uses highly efficient but less predictable forward models to sufficiently sample k-space. But unlike CS, where image priors are used to recover information absent from the measurements, we use image priors to identify the physical forward model under which sufficiently informative measurements form a high-quality image. We hence use much of the modern image priors that have been built up over the past two decades to substantially improve the robustness of efficient imaging models. We specifically do so by generalizing a simple idea called autofocus, and extend it towards arbitrary model imperfections (GAIM). 
+
+\section{Theory}
+\subsection{Formalizing GAIM}
+The data collected from an MRI exam typically follows the following forward model
+\begin{equation}
+    \b = \A(\params_\text{true}) \x_\text{true} + \mathbf{n},
+\end{equation}
+where $\params_\text{true}$ are the ground truth model parameters. For any guess of the model parameters $\params$, we can reconstruct an image according to
+\begin{equation}
+    \hat{\x}(\params) = \argmin_\x ||\A(\params) \x - \b||_2^2.
+\end{equation}
+The reconstructed image $\hat{\x}(\params)$ will likely have several artifacts present unless $\params$ is sufficiently close to $\params_\text{true}$. Thus, the goal of GAIM is to find the best artifact free image by searching over a large set of imperfection parameters $\params \in \boldsymbol{\Theta}$.
+
+Unfortunately, we can't directly use the k-space data consistency loss to search over imperfection parameters. More concretely, suppose we had $\params_\text{true}$ along with incorrect model parameters $\params_\text{false}$. Then, even when $\params_\text{false}$ is very different from $\params_\text{true}$, we can have
+\begin{equation}
+    \min_\x||\A(\params_\text{true}) \x - \b||_2^2 \approx \min_\x ||\A(\params_\text{false}) \x - \b||_2^2,
+\end{equation}
+meaning that we can't rely on data consistency alone to search over imperfection parameters.
+
+To address this data consistency ambiguity, we need a good image domain metric $m(\x)$ such that $m(\x_\text{clean}) > m(\x_\text{corrupted})$. Then we can attempt to search for the highest metric image
+\begin{align}
+    J(\params) &= m(\hat{\x}(\params)) \\
+    \params_\text{GAIM} &= \argmax_{\params \in \boldsymbol{\Theta}} J(\params).
+\end{align}
+We hypothesize that $\params_\text{GAIM} \approx \params_\text{true}$ with a good choice of the image domain metric function $m(\x)$. But this can be computationally impractical if $J(\params)$ is too expensive to compute and search through. Thus, the efficacy of the GAIM algorithm boils down to three design choices:
+\begin{enumerate}
+    \item How should $\params \in \boldsymbol{\Theta}$ parameterize the relevant family of model imperfections while remaining sufficiently low-dimensional for efficient search?
+    \item What image-domain metric $m(\x)$ best discriminates reconstructions produced by correct and incorrect forward models?
+    \item How can $J(\params)=m(\hat{\x}(\params))$ be evaluated and optimized with as few expensive reconstructions as possible?
+\end{enumerate}
+
+This work will demonstrate one particular set of choices for 1,2,3 as a proof of concept, which may not be optimal. 
+
+\end{document}
