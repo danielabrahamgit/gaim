@@ -20,6 +20,14 @@ dependencies = [
     "tqdm",
 ]
 
+[project.optional-dependencies]
+bo = [
+    "botorch>=0.16.1",
+]
+iqa = [
+    "pyiqa==0.1.16",
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

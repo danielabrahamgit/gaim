@@ -1,0 +1,18 @@
+# Core library dependencies
+torch
+numpy
+tqdm
+einops
+
+# MRI libraries (installed from their source repositories)
+hofft @ git+https://github.com/danielabrahamgit/hofft.git
+mr_recon @ git+https://github.com/danielabrahamgit/mr_recon.git
+
+# Optional Bayesian optimization and image-quality metrics
+botorch>=0.16.1
+pyiqa==0.1.16
+transformers
+
+# Experiment and comparison scripts
+matplotlib
+scipy

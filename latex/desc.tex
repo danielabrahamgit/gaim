@@ -1,15 +1,45 @@
 \documentclass{article}
 \usepackage{graphicx} % Required for inserting images
-\usepackage{amsmath}
+\usepackage{amsmath,amssymb,amsfonts, bm}
+\usepackage{mathrsfs}
 
-\title{Generalized Auto-Focus for Imperfect Models in MRI (GAIM)}
+\title{Optimal Forward Model Search: Generalizing Auto-Focus for Arbitrary Imperfections in MRI}
 \author{Daniel Raz Abraham}
 \date{September 2026}
 
+\makeatletter
+\newcommand{\xbold}[2][0.005]{\mathpalette{\xb@{#1}}{#2}}
+\newcommand{\xb@}[3]{%
+  \sbox\z@{$\m@th#2\bm{#3}$}%
+  \dimen@=#1\wd\z@
+  \hbox{%
+    \rlap{\kern-\dimen@\copy\z@}%
+    \rlap{\kern\dimen@\copy\z@}%
+    \rlap{\raise\dimen@\copy\z@}%
+    \rlap{\lower\dimen@\copy\z@}%
+    \copy\z@\kern\dimen@}%
+}
+\makeatother
+
+\newcommand{\PHI}{\xbold{\phi}}
+\newcommand{\ALPHA}{\xbold{\alpha}}
+
 \DeclareMathOperator*{\argmin}{arg\,min}
 \DeclareMathOperator*{\argmax}{arg\,max}
+\newcommand{\diag}{\textbf{diag}}
 \newcommand{\x}{\mathbf{x}}
+\renewcommand{\r}{\mathbf{r}}
+\renewcommand{\k}{\mathbf{k}}
+\newcommand{\f}{\mathbf{f}}
+\newcommand{\F}{\mathbf{F}}
+\newcommand{\g}{\mathbf{g}}
 \newcommand{\A}{\mathbf{A}}
+\newcommand{\K}{\mathbf{K}}
+\newcommand{\E}{\mathbf{E}}
+\newcommand{\M}{\mathbf{M}}
+\newcommand{\C}{\mathbf{C}}
+\renewcommand{\P}{\mathbf{P}}
+\newcommand{\B}{\mathbf{B}}
 \renewcommand{\b}{\mathbf{b}}
 \newcommand{\params}{\boldsymbol{\theta}}
 
@@ -42,18 +72,141 @@ Unfortunately, we can't directly use the k-space data consistency loss to search
 \end{equation}
 meaning that we can't rely on data consistency alone to search over imperfection parameters.
 
-To address this data consistency ambiguity, we need a good image domain metric $m(\x)$ such that $m(\x_\text{clean}) > m(\x_\text{corrupted})$. Then we can attempt to search for the highest metric image
+To address this data consistency ambiguity, we need a good image domain discriminator $d(\x)$ such that $d(\x_\text{clean}) > d(\x_\text{corrupted})$. Then we can attempt to search for the highest metric image
 \begin{align}
-    J(\params) &= m(\hat{\x}(\params)) \\
-    \params_\text{GAIM} &= \argmax_{\params \in \boldsymbol{\Theta}} J(\params).
+    \params_\text{GAIM} &= \argmax_{\params \in \boldsymbol{\Theta}} J(\params) \\
+    J(\params) &= d(\hat{\x}(\params)).
 \end{align}
 We hypothesize that $\params_\text{GAIM} \approx \params_\text{true}$ with a good choice of the image domain metric function $m(\x)$. But this can be computationally impractical if $J(\params)$ is too expensive to compute and search through. Thus, the efficacy of the GAIM algorithm boils down to three design choices:
 \begin{enumerate}
     \item How should $\params \in \boldsymbol{\Theta}$ parameterize the relevant family of model imperfections while remaining sufficiently low-dimensional for efficient search?
-    \item What image-domain metric $m(\x)$ best discriminates reconstructions produced by correct and incorrect forward models?
+    \item What image-domain discriminator $d(\x)$ best discriminates reconstructions produced by correct and incorrect forward models?
     \item How can $J(\params)=m(\hat{\x}(\params))$ be evaluated and optimized with as few expensive reconstructions as possible?
 \end{enumerate}
 
 This work will demonstrate one particular set of choices for 1,2,3 as a proof of concept, which may not be optimal. 
+
+\subsection{Off-Resonance Correction}
+Off-resonance has a phase evolution described by over space $\r$ and time $t$ and total phase $\exp\big( -j2\pi \phi(\r,t) \big)$ with
+\begin{equation}
+    \phi(\r, t) = f(\r) t,
+\end{equation}
+where $f(\r)$ is the field map. Classical Auto-Focus uses a patch based argument to significantly reduce the degrees of freedom in the off-resonance problem. The assumption is that $f(\r)$ doesn't vary much within a small iamge patch with patch coordinates $\Delta \r$ centered about $\r_m$
+\begin{equation}
+    f(\r_m + \Delta \r) \approx f[m].
+\end{equation}
+If we reconstruct an image 
+\begin{equation}
+    \hat{\x}(f) = \argmin_{\x}||\A(f) \x - \b ||_2^2
+\end{equation}
+where $\A(f)$ is a forward model with the phase $\exp\big( -j2\pi f t \big)$ incorporated into it, then we can do a 1D search per patch to estimate the optimal parameters
+\begin{align}
+    f^\star[m] &= \argmin_f J_m(f) \\
+    J_m(f) &= d(\P_m \hat{\x}(f))
+\end{align}
+
+This technique is well established, and can work surprisingly well for calibrating off resonance terms. In the rest of this work, we'll extend this approach first to arbitrary field imperfections, and then other MRI imperfections.
+
+\subsection{Generalizing Auto-Focus Towards Arbitrary Field Imperfections}
+One of the key insights in the classical auto-focus approach is that we can decouple solving for spatio-temporal field properties by looking at several candidate temporal phase evolutions, reconstructing, and then searching for the right solution on the set of reconstructed patches. This significantly saves computation, since the spatially varying search occurs after the expensive reconstruction. We'll follow a very similar approach to deal with general field imperfections, except we'll generalize how the candidate temporal phase evolutions might look.
+
+\subsubsection{Total Phase Expansion Using Smooth Temporal Bases}
+The total spatio-temporal phase is described by $\exp\big( -j2\pi \phi(\r,  t)\big)$. We'll assume that the total phase can be expanded according to 
+\begin{equation}
+    \phi(\r,t) \approx \underbrace{\begin{bmatrix} f_1(\r) \\ \vdots \\ f_P(\r) \end{bmatrix}}_{\f(\r)} \cdot \underbrace{\begin{bmatrix} g_1(t) \\ \vdots \\ g_P(t) \end{bmatrix}}_{\g(t)}.
+\end{equation}
+for some choice of temporal phase bases $\g(t)$. In the off-resonance case, we had $P=1$ and $g_1(t) = t$. But for any general field imperfections, they will be $P$ smooth functions of the gradient waveform or time. We choose an appropriate set of temporal bases $\g(t)$ and estimate $\f(\r)$. 
+
+\subsubsection{Spatially Constraining $\f(\r)$: Patch Based}
+The first approach is to stick to the Auto-Focus formulation and assume that the total phase doesn't vary drastically around some patch $\Delta \r$ centered at $\r_m$, meaning we only need to estimate per-patch parameters
+\begin{equation}
+    \f(\r_m + \Delta \r) \approx \f[m],
+\end{equation}
+This can be advantageous since we can now decouple our parameter search per patch over only $K$ parameters according to 
+\begin{align}
+    \f^\star[m] &= \argmax_{\f} J_m(\f) \\
+    J_m(\f) &= d(\P_m \hat{\x}(\f))
+\end{align}
+where $\P_m$ extracts the $m^\text{th}$ patch centered about $\r_m$. 
+
+\subsubsection{Spatially Constraining $\f(\r)$: Spatial Basis Expansion}
+The second approach we consider is instead assuming that $\f(\r)$ are well described using some spatial basis expansion $\PHI(\r) \in \mathbb{R}^B$ with $B$ bases 
+\begin{equation}
+    \f(\r) \approx \underbrace{\begin{bmatrix} \f_1 \\ \vdots \\ \f_B \end{bmatrix}}_{\F_\phi} \PHI(\r),
+\end{equation}
+where $\F_\phi \in \mathbb{R}^{P \times B}$. We then estimate the parameters $\F_\phi$ according to 
+\begin{align}
+    \F_\phi^\star &= \argmax_\F J(\F_\phi) \\ 
+    J(\F_\phi) &= m(\hat{\x}(\F_\phi)).
+\end{align}
+This now requires optimizing over $P \cdot B$ total parameters, but doesn't need to handle patches independently. 
+
+We can also combine the two approaches and take the per-patch phase parameters $\f^\star[m]$ and project onto the known set of spatial bases $\PHI(\r)$
+\begin{equation}
+    \min_{\F_\phi} \sum_{m=1}^M w_m^2|| \F_\phi \PHI(\r_m) - \f^\star[m] ||_2^2,
+\end{equation}
+where $w_m$ is a weight assigned to the $m^\text{th}$ patch.
+
+\subsubsection{Optimizing $J(\f)$}
+Depending on the number of parameters $P = \text{dim}(\f)$, we have different strategies for optimizing $J(\f)$. Generally speaking, we want to solve
+\begin{equation}
+    \f^\star = \argmax_{\f} J(\f) \equiv m(\hat{\x}(\f)).
+\end{equation}
+Note that we omit the patch based version in this description as it is a trivial to extend these techniques independently per patch.\\
+
+\noindent \textbf{Small $P$} \\
+When $P$ is small, an exhaustive search on $\f$ over some $N_f$ values $\f_1, \dots, \f_{N_f}$ can be feasible. There are no assumptions on the cost function, which makes this method extremely robust. However the number of values to search over $N_f$ usually scales exponentially in $P$, which becomes too expensive due to the cost of evaluating $J(\f)$ $N_f$ times.\\
+
+\noindent \textbf{Medium $P$} \\
+If $P$ is medium size, then we can use a Bayesian optimization approach to minimize the number of $J(\f)$ evaluations. This specifically starts to fail when $P > 20$ parameters, as the search space gets a bit too large. \\
+
+\noindent \textbf{Large $P$} \\
+If $P$ is large, we use a taylor expansion of the exponential 
+\begin{align}
+    \exp\big(-j2\pi \f \cdot \g(t) \big) &\approx 1 + \f \cdot (-j2\pi \g(t)) \\
+    \hat{\x}_p &\equiv \argmin_\x ||\diag(-j2\pi g_p(t)) \A \x - \b||_2^2\\
+    \hat{\x}(\f) &\approx \hat{\x}(\mathbf{0}) + \sum_p f_p \hat{\x}_p.
+\end{align}
+This makes $J(\f)$ much easier to evaluate, only requiring $P+1$ reconstructions for a large continuum of $\f$ that don't violate the small angle approximation. The downside to this approach is that the small angle assumption will be violated when $\f$ gets large. Thus, it may need more iterative re-evaluations, replacing $\A \gets \A(\params_\text{best})$ and searching over $\f$ around a small neighborhood centered about the previous estimate every so often.
+
+\subsubsection{Efficiently Evaluating $\hat{\x}(\f)$}
+Optimization will require several evaluations of 
+\begin{equation}
+    \hat{\x}(\f) = \argmin_{\x} ||\A(\f) \x - \b||_2^2.
+\end{equation}
+
+Suppose that we only care about searching over $\f$ in some range yielding $N_f$ total parameters $\f_1, \dots, \f_{N_f}$. We can often significantly compress down the phase matrix according to 
+\begin{equation}
+\begin{bmatrix} \E \end{bmatrix}_{n,t} = \exp\big( -j2\pi \f_n \cdot \g(t) \big) 
+\end{equation}
+for $n \in \{1, \dots, N_f\}$ and $t \in \{1, \dots, T\}$. We can then apply an SVD to the $N_f \times T$ matrix $\E$ to obtain 
+\begin{align}
+    \exp\big( -j2\pi \f \cdot \g \big) &\approx \sum_{l=1}^L b_l(\f) c_l(\g) \\
+    \implies \A(\f) &\approx \sum_{l=1}^L \C_l(\g) \A \B_l(\f), 
+\end{align}
+where $\A$ is the forward model without the new phase introduced, and $\C_l(\g), \B_l(\f)$ are diagonal matrices with entries $c_l(\g(t)), b_l(\f(\r))$ along the diagonal entries. Inverting $\A(\f)$ will cost about $L$ times more computation than inverting $\A$, so the total multiplicative increase is $L N_f$, where $N_f$ is the number of new $\f$ parameters we observe.
+
+We can make a useful approximation to substantially reduce the multiplicative increase in computation down to $L$ according to $\A^\dagger (\f)\approx \B^H(\f) \A^\dagger \C^H(\g)$ yielding
+\begin{align}
+\hat{\x}_l &= \argmin_\x||\A \x - \C_l^H(\g) \b||_2^2 \\
+\hat{\x}(\f) &\approx \sum_{l=1}^L \B_l^H(\f)\hat{\x}_l .
+\end{align}
+This approximation can often be good enough to optimize the image discriminator $d(\x)$, but should not be used for the final reconstruction.
+
+
+\subsubsection{Special Case for $\g(t)$: GIRF}
+Under some reasonable assumptions, there is a compact Gradient Impulse Response Function (GIRF) relationship between the temporal phase coefficients $\ALPHA(t) \in \mathbb{R}^{16}$ and the gradient waveforms $G_x(t), G_y(t), G_z(t)$
+\begin{equation}
+    \PHI(\r) \cdot \ALPHA(t) \approx \sum_{i \in \{x,y,z\}}h_i(\r, t) \ast G_i(t).
+\end{equation}
+where $h_i(\r, t)$ is the GIRF at spatial position $\r$ for the $i^\text{th}$ gradient axis. These GIRFs are well modeled using smooth functions in the frequency domain. As such, we parameterize the GIRF in the frequency domain with splines, polynomials, or any other smooth basis expansion
+\begin{equation}
+    H_i(\r, f) \approx \sum_{q=1}^Q f_{i,q}(\r) S_q(f).
+\end{equation}
+Thus our new phase expansion becomes
+\begin{equation}
+    \phi(\r, t) \approx \sum_Q \sum_{i \in \{x,y,z\}}  f_{i,q}(\r) g_{i,q}(t),
+\end{equation}
+where $\g_{i,q}(t) = s_q(t) \ast G_i(t)$ and $S_q(f) = \mathcal{F}\{s_q(t)\}$.
 
 \end{document}
