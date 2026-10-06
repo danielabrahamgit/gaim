@@ -75,11 +75,9 @@ def compress_bases(bases: torch.Tensor,
     # Reshape
     return bases_new.reshape((bases_new.shape[0], *bases.shape[1:]))
         
-        
-        
-
 def linear_time_bases(trj: torch.Tensor,
-                      readout_dim: int = 0) -> torch.Tensor:
+                      readout_dim: int = 0,
+                      expand_empty_dims: bool = True) -> torch.Tensor:
     """
     linear time only, useful for B0 modeling
     
@@ -89,6 +87,8 @@ def linear_time_bases(trj: torch.Tensor,
         trajectory tensor, shape (..., D)
     readout_dim: int
         dimension of the readout dimension
+    expand_empty_dims: bool
+        if True, expand the empty dimensions to match non-readout dimension sizes
     
     Returns
     -------
@@ -101,7 +101,45 @@ def linear_time_bases(trj: torch.Tensor,
                          dtype=trj.dtype, device=trj.device)
     g = g.reshape(*shape)
     
+    if expand_empty_dims:
+        g = g.expand(trj.shape[:-1])
+        
     return g[None, ...]
+
+def poly_time_bases(trj: torch.Tensor,
+                    num_polys: int = 3,
+                    readout_dim: int = 0,
+                    expand_empty_dims: bool = True) -> torch.Tensor:
+    """
+    Polynomial in time, useful for B0 modeling
+    
+    Args
+    ----
+    trj: torch.Tensor
+        trajectory tensor, shape (..., D)
+    num_polys: int
+        number of polynomial basis functions
+    readout_dim: int
+        dimension of the readout dimension
+    expand_empty_dims: bool
+        if True, expand the empty dimensions to match non-readout dimension sizes
+        
+    Returns
+    -------
+    g: torch.Tensor
+        basis functions, shape (num_polys, ...,)
+    """
+    shape = [1] * (trj.ndim - 1)
+    shape[readout_dim] = -1
+    g = torch.linspace(0, 1, trj.shape[readout_dim], 
+                         dtype=trj.dtype, device=trj.device)
+    g = g.reshape(*shape)
+    g = [g ** i for i in range(1, num_polys+1)]
+    g = torch.stack(g, dim=0)
+    
+    if expand_empty_dims:
+        g = g.expand((g.shape[0], *trj.shape[:-1]))
+    return g
 
 def polar_poly_fourier_bases(trj: torch.Tensor,
                              num_radial: int = 3,
@@ -161,39 +199,45 @@ def polar_poly_fourier_bases(trj: torch.Tensor,
     
     return g
 
-
 def _cubic_bspline(u: torch.Tensor) -> torch.Tensor:
     u = u.abs()
     return torch.where(u < 1, (4 - 6 * u.square() + 3 * u**3) / 6,
                        (2 - u).clamp_min(0)**3 / 6)
 
-
 def _hermitian_spline_spectrum(freq_hz: torch.Tensor,
                                n_knots: int,
-                               max_freq_hz: float) -> torch.Tensor:
+                               max_freq_hz: float,
+                               min_freq_hz: float = 0.0) -> torch.Tensor:
     """Even real cubic B-splines B_q(f) on an rFFT grid, shape (n_freq, Q).
 
     Each B_q is Hermitian (B_q(-f) = B_q(f)), so b_q = IFFT(B_q) is real.
-    The spectrum is tapered to 0 over the last knot interval.
+    The spectrum is tapered to 0 over the last knot interval and, for a
+    positive minimum frequency, over the first knot interval as well.
     """
     if n_knots < 3:
         raise ValueError('Need at least three spline knots')
-    knot_hz = torch.linspace(0, max_freq_hz, n_knots, device=freq_hz.device, dtype=freq_hz.dtype)
-    spacing = max_freq_hz / (n_knots - 1)
+    if not 0 <= min_freq_hz < max_freq_hz:
+        raise ValueError('Require 0 <= min_freq_hz < max_freq_hz')
+    knot_hz = torch.linspace(min_freq_hz, max_freq_hz, n_knots, device=freq_hz.device, dtype=freq_hz.dtype)
+    spacing = (max_freq_hz - min_freq_hz) / (n_knots - 1)
     positive = _cubic_bspline((freq_hz[:, None] - knot_hz) / spacing)
     negative = _cubic_bspline((freq_hz[:, None] + knot_hz) / spacing)
     basis = positive + negative
-    basis[:, 0] *= 0.5
+    if min_freq_hz == 0:
+        basis[:, 0] *= 0.5
     taper = 0.5 * (1 + torch.cos(torch.pi * ((freq_hz - (max_freq_hz - spacing)) / spacing).clamp(0, 1)))
+    if min_freq_hz > 0:
+        taper *= 0.5 * (1 - torch.cos(torch.pi * ((freq_hz - min_freq_hz) / spacing).clamp(0, 1)))
     basis = basis * taper[:, None]
-    basis = torch.where(freq_hz[:, None] >= max_freq_hz, torch.zeros_like(basis), basis)
+    basis = torch.where((freq_hz[:, None] < min_freq_hz) | (freq_hz[:, None] >= max_freq_hz),
+                        torch.zeros_like(basis), basis)
     return basis.to(torch.complex128)
-
 
 def girf_bases(grad: torch.Tensor,
                dt: float,
                readout_dim: int = 0,
                num_splines: int = 10,
+               min_freq_hz: float = 0.0,
                max_freq_hz: float = 20e3,
                return_spectrum: bool = False):
     """
@@ -203,10 +247,12 @@ def girf_bases(grad: torch.Tensor,
 
         exp(-j 2π sum_d (p_d * g_d)(t)),     p_d(f) = sum_q B_q(f) c_{q,d}.
 
-    B_q(f) are cubic B-splines on [0, max_freq_hz], even-extended so they are
+    B_q(f) are cubic B-splines on [min_freq_hz, max_freq_hz], even-extended so they are
     Hermitian and b_q(t) = IFFT(B_q) is real. Complex c_q = a_q + j b_q then
     gives two real filters per spline: IFFT(B_q) and IFFT(j B_q). DC and
-    Nyquist of the j B_q spectra are zeroed so the IR stays real.
+    Nyquist of the j B_q spectra are zeroed so the IR stays real. Spectra
+    vanish outside the requested absolute-frequency range and taper over one
+    knot interval at each edge (no lower taper when min_freq_hz is zero).
 
     Each b_q is treated as a finite noncausal FIR (t = 0 at the center).
     Convolution with g_d is linear, not circular: both sequences are
@@ -228,7 +274,10 @@ def girf_bases(grad: torch.Tensor,
     readout_dim : int
         Axis of `grad` that is time.
     num_splines : int
-        Number of knots Q on [0, max_freq_hz].
+        Number of knots Q on [min_freq_hz, max_freq_hz].
+    min_freq_hz : float
+        Lower spline cutoff in Hz, with 0 <= min_freq_hz < max_freq_hz.
+        Defaults to zero to retain the full low-frequency response.
     max_freq_hz : float
         Spline cutoff in Hz, at most Nyquist.
     return_spectrum : bool
@@ -249,17 +298,16 @@ def girf_bases(grad: torch.Tensor,
     """
     if grad.ndim < 2:
         raise ValueError('grad must have a time axis and a trailing axis dimension')
-    n_axes = grad.shape[-1]
-    if n_axes not in (2, 3):
-        raise ValueError('grad trailing dimension must be 2 or 3 axes')
     nyquist = 0.5 / dt
     if not 0 < max_freq_hz <= nyquist:
         raise ValueError('max_freq_hz must lie in (0, Nyquist]')
+    if not 0 <= min_freq_hz < max_freq_hz:
+        raise ValueError('Require 0 <= min_freq_hz < max_freq_hz')
 
     n_time = grad.shape[readout_dim]
     n_ir = 1 << (2 * n_time - 1).bit_length()
     freq_hz = torch.fft.rfftfreq(n_ir, d=dt, device=grad.device, dtype=torch.float64)
-    B = _hermitian_spline_spectrum(freq_hz, num_splines, max_freq_hz)
+    B = _hermitian_spline_spectrum(freq_hz, num_splines, max_freq_hz, min_freq_hz)
     # Real coeff uses B_q; imag coeff uses j B_q. rFFT Nyquist is real.
     basis_fft = torch.cat((B, 1j * B), dim=1)
     basis_fft[0, num_splines:] = 0

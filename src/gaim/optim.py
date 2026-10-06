@@ -3,189 +3,31 @@ Contains many tools for optimization
 """
 import torch
 
-from einops import einsum
 from tqdm import tqdm
+from einops import einsum
+from .metrics import gradient_entropy_metric
+from typing import Optional
 
-def _phase_subsample(phis_flt, g_flt, n_space, n_time):
-    """Fixed spatial/temporal samples. Prefer support voxels so the mask is not wasted."""
-    n_space = min(n_space, phis_flt.shape[-1])
-    n_time = min(n_time, g_flt.shape[-1])
-    on = phis_flt.abs().sum(0) > 0
-    pool = torch.where(on)[0] if on.any() else torch.arange(phis_flt.shape[-1], device=phis_flt.device)
-    n_space = min(n_space, pool.numel())
-    idxr = pool[torch.randperm(pool.numel(), device=phis_flt.device)[:n_space]]
-    idxt = torch.randperm(g_flt.shape[-1], device=g_flt.device)[:n_time]
-    return phis_flt[:, idxr], g_flt[:, idxt]
-
-
-def _coeff_scale(phis_flt, g_flt, wrap):
-    """Per-entry scale so raw[b,p] ~ 1 is about ``wrap`` from basis b, p."""
-    s_phi = phis_flt.abs().amax(dim=1).clamp_min(1e-12)
-    s_g = g_flt.abs().amax(dim=1).clamp_min(1e-12)
-    scale = 1.0 / (s_phi[:, None] * s_g[None, :])
-    if wrap is not None and wrap < float('inf'):
-        scale = scale * wrap
-    return scale
-
-
-def _sampled_phase_stats(F, phis_s, g_s, p=8, time_chunk=256,
-                         want_max=False, want_pnorm=False):
-    """Chunked |phi^T F g| stats. Does not form the full n_space x n_time array."""
-    Fg = F @ g_s
-    n = phis_s.shape[1] * Fg.shape[1]
-    acc = F.new_zeros(()) if want_pnorm else None
-    m = F.new_zeros(()) if want_max else None
-    for t0 in range(0, Fg.shape[1], time_chunk):
-        phase_abs = (phis_s.T @ Fg[:, t0:t0 + time_chunk]).abs()
-        if want_pnorm:
-            acc = acc + phase_abs.pow(p).sum()
-        if want_max:
-            m = phase_abs.max() if m is None else torch.maximum(m, phase_abs.max())
-    pnorm = (acc / n + 1e-24).pow(1 / p) if want_pnorm else None
-    return pnorm, m
-
-
-def _sampled_phase_max(F, phis_s, g_s):
-    """max |phi^T F g| on a fixed spatial/temporal subsample."""
-    _, m = _sampled_phase_stats(F, phis_s, g_s, want_max=True)
-    return m
-
-
-def _sampled_phase_pnorm(F, phis_s, g_s, p=8):
-    """Mean p-norm of |phi^T F g|; <= the sampled max."""
-    pnorm, _ = _sampled_phase_stats(F, phis_s, g_s, p=p, want_pnorm=True)
-    return pnorm
-
-
-def _taylor_sph_setup(phis, g_bases, max_phase_wrap,
-                      n_space, n_time, n_check_space, n_check_time):
-    g_flt = g_bases.reshape(g_bases.shape[0], -1)
-    phis_flt = phis.reshape(phis.shape[0], -1)
-    constrain = max_phase_wrap is not None and max_phase_wrap < float('inf')
-    wrap = max_phase_wrap if constrain else 1.0
-    phis_s, g_s = _phase_subsample(phis_flt, g_flt, n_space, n_time)
-    phis_c, g_c = _phase_subsample(phis_flt, g_flt, n_check_space, n_check_time)
-    scale = _coeff_scale(phis_flt, g_flt, wrap).to(dtype=phis.dtype)
-    return g_flt, phis_s, g_s, phis_c, g_c, scale, constrain, wrap
-
-
-def _taylor_sph_loss(F, loss_fn, g_flt, phis_s, g_s,
-                     alpha_reg, penalty_weight, constrain, wrap, phase_p=8):
-    """Shared Adam / L-BFGS objective. Phase max is not computed here."""
-    metric = loss_fn(F)
-    loss = metric
-    if alpha_reg:
-        loss = loss + alpha_reg * (F @ g_flt).square().mean()
-    if constrain:
-        phase_pnorm, _ = _sampled_phase_stats(
-            F, phis_s, g_s, p=phase_p, want_pnorm=True)
-        over = phase_pnorm / wrap - 1
-        loss = loss + penalty_weight * torch.relu(over).square()
-    return loss, metric
-
-
-def _report_dense_phase(F, phis_c, g_c, constrain, wrap):
-    """Log max |phi^T F g| on a denser sample. Does not modify F."""
-    if not constrain:
-        return F
-    with torch.no_grad():
-        phase_chk = _sampled_phase_max(F, phis_c, g_c)
-        tqdm.write(f'dense phase max {phase_chk.item():.4f} (cap {wrap:g})')
-    return F
-
-
-def taylor_sph_optim(F_phi_init: torch.tensor,
-                     phis: torch.tensor,
-                     g_bases: torch.tensor,
-                     loss_fn: callable,
-                     n_iter: int = 100,
-                     lr: float = 1e-2,
-                     alpha_reg: float = 0.0,):
+def _lbfgs_direction(grad: torch.Tensor, 
+                     s_hist: list[torch.Tensor], 
+                     y_hist: list[torch.Tensor]) -> torch.Tensor:
     """
-    Adam on the Taylor SPH metric. The wrap cap is not enforced here;
-    ``taylor_sph_lbfgs`` rejects steps that exceed it.
-    """
-    M = 1_000
-    phis_flt = phis.reshape(phis.shape[0], -1)
-    g_flt = g_bases.reshape(g_bases.shape[0], -1)
-    rnd_vox = torch.randperm(phis_flt.shape[1], device=phis_flt.device)[:M]
-    rnd_time = torch.randperm(g_flt.shape[1], device=g_bases.device)[:M]
-    F_opt = torch.nn.Parameter(F_phi_init.clone(), requires_grad=True)
-    opt = torch.optim.Adam([F_opt], lr=lr)
-    tbar = tqdm(range(n_iter), desc='Taylor SPH ADAM Loop')
-    for n in tbar:
-        opt.zero_grad()
-        loss = loss_fn(F_opt)
-        phase = (phis_flt[:, rnd_vox].T @ F_opt @ g_flt[:, rnd_time])
-        loss += alpha_reg * phase.abs().mean()
-        # alphas = einsum(F_opt, g_bases, 'B P, P ... -> B ...')
-        # loss += alpha_reg * alphas.square().mean()
-        loss.backward()
-        opt.step()
-        if n % 100 == 0:
-            tbar.set_postfix(metric=f'{loss.item():.6g}', phase=f'{phase.max().item():.4f}')
-    return F_opt.detach()
-
-
-def taylor_patch_optim(f_init: torch.tensor,
-                       g_bases: torch.tensor,
-                       loss_fn: callable,
-                       n_iter: int = 100,
-                       lr: float = 1e-2,
-                       alpha_reg: float = 1.5e-3):
-    """
-    Same Adam loop as taylor_sph_optim, batched over patches.
-
+    Two-loop recursion: d = -H g. Empty history is steepest descent.
+    
     Args
     ----
-    f_init: torch.tensor
-        Per-patch coefficients, shape (G, P)
-    g_bases: torch.tensor
-        Temporal bases, shape (P, *trj_size)
-    loss_fn: callable
-        Maps (G, P) to per-patch losses of shape (G,)
+    grad : torch.Tensor
+        The gradient of the loss function.
+    s_hist : list[torch.Tensor]
+        The history of the search directions.
+    y_hist : list[torch.Tensor]
+        The history of the search directions.
+        
+    Returns    
+    ------- 
+    q : torch.Tensor
+        The search direction.
     """
-    g_flt = g_bases.reshape((g_bases.shape[0], -1))
-    f = torch.nn.Parameter(f_init.clone())
-    opt = torch.optim.Adam([f], lr=lr)
-
-    tbar = tqdm(range(n_iter), desc='Taylor patch ADAM')
-    for _ in tbar:
-        opt.zero_grad()
-        losses = loss_fn(f)
-        losses = losses + alpha_reg * (f @ g_flt).norm(dim=-1)
-        loss = losses.sum()
-        loss.backward()
-        opt.step()
-        tbar.set_postfix(loss=losses.mean().log10().item())
-    return f.detach()
-
-
-def _phi_inf(phis):
-    return phis.reshape(phis.shape[0], -1).abs().amax(dim=1).clamp_min(1e-12)
-
-
-def _alpha_wrap_max(F, phis, g_bases):
-    """max_b ||phi_b||_∞ · max_t | (F g)_b(t) |."""
-    alphas = F @ g_bases.reshape(g_bases.shape[0], -1).to(dtype=F.dtype)
-    return (alphas.abs() * _phi_inf(phis).to(dtype=F.dtype)[:, None]).max()
-
-
-def _net_phase_max(F, phis, g_bases, time_chunk=64):
-    """max |phi^T F g| over support voxels, chunked in time."""
-    g_flt = g_bases.reshape(g_bases.shape[0], -1).to(dtype=F.dtype)
-    phis_flt = phis.reshape(phis.shape[0], -1).to(dtype=F.dtype)
-    alphas = F @ g_flt
-    on = phis_flt.abs().sum(0) > 0
-    phi_on = phis_flt[:, on] if on.any() else phis_flt
-    m = F.new_zeros(())
-    for t0 in range(0, alphas.shape[1], time_chunk):
-        m = torch.max(m, (phi_on.T @ alphas[:, t0:t0 + time_chunk]).abs().max())
-    return m
-
-
-def _lbfgs_direction(grad, s_hist, y_hist):
-    """Two-loop recursion: d = -H g. Empty history is steepest descent."""
     q = grad.clone()
     alphas = []
     for s, y in zip(reversed(s_hist), reversed(y_hist)):
@@ -204,188 +46,310 @@ def _lbfgs_direction(grad, s_hist, y_hist):
         q = q + s * (a - rho * y.dot(q))
     return -q
 
-
-def taylor_sph_lbfgs(F_phi_init: torch.tensor,
-                     phis: torch.tensor,
-                     g_bases: torch.tensor,
-                     loss_fn: callable,
-                     max_phase_wrap: float = 0.25,
-                     n_iter: int = 50,
-                     lr: float = 1.0,
-                     alpha_reg: float = 0.0,
-                     penalty_weight: float = 0.0,
-                     n_space: int = 256,
-                     n_time: int = 256,
-                     n_check_space: int = 4096,
-                     n_check_time: int = 4096,
-                     history_size: int = 20,
-                     setup=None):
+def phase_bound(F: torch.Tensor, 
+                phis: torch.Tensor, 
+                bases: torch.Tensor) -> torch.Tensor:
     """
-    L-BFGS on the B×P Taylor SPH matrix.
+    Conservative bound on max_{r,t}|phi(r)^T F g(t)|, in cycles.
 
-    Armijo trials evaluate the loss under ``no_grad`` and are rejected when
-    ``max |phi^T F g|`` on the optimization samples exceeds ``max_phase_wrap``.
-    A backward pass runs only at an accepted point. The optional p-norm
-    penalty is off unless ``penalty_weight`` is set. A denser sample is
-    logged at the end and does not rescale ``F``.
+    Triangle inequality avoids allocating the huge space-by-time phase array.
+    Unlike sampled checks, this covers every voxel and trajectory sample.
+
+    Args
+    F : torch.Tensor
+        The encoding operator.
+    phis : torch.Tensor
+        The phase encoding.
+    bases : torch.Tensor
+        The basis functions.
+
+    Returns
+    -------
+    bound : torch.Tensor
+        The conservative bound on max_{r,t}|phi(r)^T F g(t)|, in cycles.
     """
-    g_flt, phis_s, g_s, phis_c, g_c, scale, constrain, wrap = (
-        setup if setup is not None else _taylor_sph_setup(
-            phis, g_bases, max_phase_wrap, n_space, n_time, n_check_space, n_check_time))
-    raw = torch.nn.Parameter((F_phi_init.clone() / scale).contiguous())
+    phi_max = phis.flatten(1).abs().amax(1)
+    return (phi_max[:, None] * (F @ bases.flatten(1)).abs()).sum(0).amax()
 
-    def pack_loss(F):
-        return _taylor_sph_loss(
-            F, loss_fn, g_flt, phis_s, g_s, alpha_reg, penalty_weight, constrain, wrap)
+def local_step(x0: torch.Tensor, 
+               responses: torch.Tensor, 
+               phis: torch.Tensor, 
+               bases: torch.Tensor, 
+               metric: callable, 
+               radius: float, 
+               max_steps: int,
+               coefficient_penalty=None) -> tuple[torch.Tensor, dict]:
+    """
+    L-BFGS ascent of the Taylor metric, stopping at the phase boundary.
+    
+    Args
+    ----
+    x0 : torch.Tensor
+        The initial guess with shape (*im_size)
+    responses : torch.Tensor
+        The responses with shape (P, *num_samples)
+    phis : torch.Tensor
+        The spatial phase basis functions with shape (B, *im_size)
+    bases : torch.Tensor
+        The temporal basis functions with shape (P, *trj_size)
+    metric : callable
+        The metric function with signature metric(image: torch.Tensor) -> float.
+    radius : float
+        The radius of the trust region.
+    max_steps : int
+        The maximum number of steps.
+    coefficient_penalty : callable, optional
+        Additional loss penalty(delta_F, Taylor_image), e.g. data consistency.
+        
+    Returns
+    """
+    # Consts
+    B = len(phis)
+    P = len(bases)
+    
+    # We start with a zero F_param
+    delta_F = torch.zeros(B, P, dtype=phis.dtype, device=phis.device)
 
-    def eval_loss():
+    # Loss function eval using taylor model
+    def loss(F):
+        # Contract in this order to avoid storing B*P full derivative images.
+        change = (F.to(responses.dtype) @ responses.flatten(1)).reshape_as(phis)
+        image = x0 + (phis * change).sum(0)
+        value = -metric(image)
+        if coefficient_penalty is not None:
+            value = value + coefficient_penalty(F, image)
+        return value
+
+    # Value and gradient of the loss function
+    def value_gradient(F):
+        F = F.detach().requires_grad_(True)
+        value = loss(F)
+        gradient, = torch.autograd.grad(value, F)
+        return value.detach(), gradient.detach().flatten()
+
+    value, gradient = value_gradient(delta_F)
+    initial_value = value.clone()
+    s_history, y_history = [], []
+    steps, reason = 0, 'iteration_limit'
+    for _ in range(max_steps):
+        if gradient.abs().max() < 1e-7:
+            reason = 'gradient_small'
+            break
+        direction = _lbfgs_direction(gradient, s_history, y_history).reshape_as(delta_F)
+        if gradient.dot(direction.flatten()) >= 0:
+            s_history, y_history = [], []
+            direction = (-gradient / gradient.norm().clamp_min(1e-12)).reshape_as(delta_F)
+        # A short first step gathers curvature before attempting the boundary.
+        length = (0.25 * radius / phase_bound(direction, phis, bases).clamp_min(1e-12).item()
+                  if not s_history else 1.0)
+        accepted = False
         with torch.no_grad():
-            loss, metric = pack_loss(raw * scale)
-            return loss.detach(), metric.detach()
-
-    def eval_with_grad():
-        if raw.grad is not None:
-            raw.grad.zero_()
-        loss, metric = pack_loss(raw * scale)
-        loss.backward()
-        return loss.detach(), raw.grad.detach().reshape(-1).clone(), metric.detach()
-
-    def phase_ok():
-        if not constrain:
-            return True
-        with torch.no_grad():
-            phase = _sampled_phase_max(raw * scale, phis_s, g_s)
-        return bool(phase <= wrap * (1 + 1e-5))
-
-    def armijo(x0, direction, t_init, loss, gtd):
-        t = t_init
-        for _ in range(20):
-            raw.data.copy_((x0 + t * direction).view_as(raw))
-            trial_loss, trial_metric = eval_loss()
-            if (phase_ok() and torch.isfinite(trial_loss)
-                    and trial_loss.item() <= loss.item() + 1e-4 * t * gtd.item()):
-                return True, t, trial_loss, trial_metric
-            t *= 0.5
-        raw.data.copy_(x0.view_as(raw))
-        return False, t, loss, None
-
-    def log_phase(F):
-        if not constrain:
-            return F.new_zeros(())
-        with torch.no_grad():
-            return _sampled_phase_max(F, phis_s, g_s)
-
-    s_hist, y_hist = [], []
-    loss, grad, metric = eval_with_grad()
-    phase_max = log_phase(raw.detach() * scale)
-    t_trial = min(float(lr), 1.0 / grad.abs().sum().clamp_min(1e-12).item())
-
-    tbar = tqdm(range(n_iter), desc='Taylor SPH L-BFGS')
-    for _ in tbar:
-        direction = _lbfgs_direction(grad, s_hist, y_hist)
-        gtd = grad.dot(direction)
-        if gtd >= 0:
-            s_hist, y_hist = [], []
-            direction = -grad / grad.norm().clamp_min(1e-12)
-            gtd = grad.dot(direction)
-
-        x0 = raw.detach().reshape(-1).clone()
-        accepted, t, _, _ = armijo(x0, direction, t_trial, loss, gtd)
-
+            for _ in range(20):
+                trial = delta_F + length * direction
+                bound = phase_bound(trial, phis, bases).item()
+                boundary = bound >= radius
+                if boundary:
+                    trial *= (1 - 1e-6) * radius / bound
+                # Never evaluate the Taylor objective outside its trust region.
+                displacement = (trial - delta_F).flatten()
+                slope = gradient.dot(displacement)
+                trial_value = loss(trial)
+                if (slope < 0 and torch.isfinite(trial_value)
+                        and trial_value <= value + 1e-4 * slope):
+                    accepted = True
+                    break
+                length *= 0.5
         if not accepted:
-            s_hist, y_hist = [], []
-            sd = -grad / grad.norm().clamp_min(1e-12)
-            gtd_sd = grad.dot(sd)
-            accepted, t, _, _ = armijo(x0, sd, t_trial, loss, gtd_sd)
+            reason = 'line_search_failed'
+            break
+        new_value, new_gradient = value_gradient(trial)
+        y = new_gradient - gradient
+        # Positive curvature keeps the approximate inverse Hessian well behaved.
+        if displacement.dot(y) > 1e-8 * displacement.norm() * y.norm():
+            s_history = (s_history + [displacement])[-10:]
+            y_history = (y_history + [y])[-10:]
+        improvement = (value - new_value).item()
+        delta_F, value, gradient = trial, new_value, new_gradient
+        steps += 1
+        if boundary or phase_bound(delta_F, phis, bases) >= 0.99 * radius:
+            reason = 'phase_boundary'
+            break
+        if improvement <= 1e-8:
+            reason = 'objective_stalled'
+            break
+    return delta_F, dict(predicted_gain=(initial_value - value).item(), inner_steps=steps,
+                       phase_bound=phase_bound(delta_F, phis, bases).item(), stop_reason=reason)
+
+def taylor_trust(phis: torch.Tensor, 
+                 bases: torch.Tensor, 
+                 ksp: torch.Tensor, 
+                 build_linop: callable, 
+                 recon: callable, 
+                 metric: callable=gradient_entropy_metric,
+                 F_init: Optional[torch.Tensor] = None,
+                 outer_steps=30, inner_steps=25, radius=0.1, max_radius=1,
+                 P_batch_size=1, max_retries=4, verbose=True):
+    """
+    Iteratively builds a taylor expansion around the current operating point, then 
+    optimizes the taylor model using local_step. Rejects inaccurate predictions and 
+    retries
+    
+    Args 
+    ----
+    phis : torch.Tensor
+        The spatial phase basis functions with shape (B, *im_size)
+    bases : torch.Tensor
+        The temporal basis functions with shape (P, *trj_size)
+    ksp : torch.Tensor
+        The k-space data with shape (C, *ksp_size)
+    build_linop : callable
+        The function to build the encoding operator from alphas = F @ bases as input
+    recon : callable
+        The function to reconstruct the image from the encoding operator and k-space data
+    metric : callable
+        The metric function with signature metric(image: torch.Tensor) -> float.
+    outer_steps : int
+        The number of outer steps.
+    inner_steps : int
+        The number of inner L-BFGS steps.
+    radius : float
+        The radius of the trust region in cycles.
+    max_radius : float
+        The maximum radius of the trust region in cycles.
+    max_retries : int
+        The maximum number of retries.
+    verbose : bool
+        Whether to print verbose output.
+        
+    Returns
+    -------
+    dict
+        A dictionary containing the following keys:
+        - F : torch.Tensor
+            The parameters we're solving for with shape (B, P)
+        - alphas : torch.Tensor
+            The same as F @ bases, with shape (B, *trj_size)
+        - image : torch.Tensor
+            The reconstructed image with shape (*im_size)
+        - initial_image : torch.Tensor
+            The initial image with shape (*im_size)
+        - initial_score : float
+            The initial score
+        - final_score : float
+            The final score
+        - history : list[dict]
+            The history of the optimization.
+            Each dictionary contains the following keys:
+            - outer : int
+                The outer step.
+            - retry : int
+                The retry number.
+            - radius : float
+                The radius of the trust region.
+    """
+    # Consts
+    B = len(phis)
+    P = len(bases)
+    
+    # Check 
+    if min(outer_steps, inner_steps, max_retries) < 1 or not 0 < radius <= max_radius:
+        raise ValueError('Positive iteration counts and 0 < radius <= max_radius required')
+    
+    # Rescale phis and bases to improve conditioning without changing phi^T F g or returned alphas.
+    phi_scale = phis.flatten(1).abs().amax(1).clamp_min(1e-12)
+    g_scale = bases.flatten(1).abs().amax(1).clamp_min(1e-12)
+    phi = phis / phi_scale.reshape(-1, *([1] * (phis.ndim - 1)))
+    g = bases / g_scale.reshape(-1, *([1] * (bases.ndim - 1)))
+    
+    # We start with a zero F_param
+    if F_init is None:
+        F_param = torch.zeros(B, P, dtype=phis.dtype, device=phis.device)
+    else:
+        F_param = F_init / phi_scale[:, None] / g_scale[None, :]
+
+    # Gets alphas from F 
+    def alphas_from(F):
+        return ((F / phi_scale[:, None]) @ g.flatten(1)).reshape(len(phis), *bases.shape[1:])
+
+    # Build initial forward model, image, and score
+    with torch.no_grad():
+        operator = build_linop(alphas_from(F_param))
+        image = recon(operator, ksp)
+        score = metric(image).item()
+        
+    # Save initial image and score to see how much we improve
+    initial_image, initial_score = image.clone(), score
+    
+    # Iterate over outer steps
+    history = []
+    for outer in tqdm(range(outer_steps), desc='Outer steps', disable=not verbose):
+        
+        # Build P responses for the current operating point
+        print(f'Building responses for P = {P}')
+        with torch.no_grad():
+            if P_batch_size == 1:
+                responses = torch.stack([recon(operator, ksp * (2j * torch.pi * gp)) for gp in g])
+            else:
+                responses = []
+                for p1 in range(0, P, P_batch_size):
+                    p2 = min(p1 + P_batch_size, P)
+                    responses.append(recon(operator, ksp[None,] * (2j * torch.pi * g[p1:p2, None,])))
+                responses = torch.cat(responses, dim=0)
+        
+        # Now we will see if the taylor model is accurate enough to accept the update
+        accepted = False
+        for retry in range(max_retries):
+            
+            # Optimize the taylor model with L-BFGS
+            delta_F, info = local_step(image, responses, phi, g, metric, radius, inner_steps)
+            
+            # Convergence check
+            if info['predicted_gain'] <= 1e-8:
+                break
+            
+            # Check the real model at the proposed update
+            with torch.no_grad():
+                candidate = F_param + delta_F
+                candidate_operator = build_linop(alphas_from(candidate))
+                candidate_image = recon(candidate_operator, ksp)
+                candidate_score = metric(candidate_image).item()
+            actual_gain = candidate_score - score
+            ratio = actual_gain / info['predicted_gain']
+            accepted = actual_gain > 0 and ratio >= 0.1
+            history.append(dict(outer=outer + 1, retry=retry, radius=radius, **info,
+                                score_before=score, candidate_score=candidate_score,
+                                actual_gain=actual_gain, ratio=ratio, accepted=accepted,
+                                delta_F=(delta_F / phi_scale[:, None] / g_scale[None, :]).cpu()))
+            if verbose:
+                print(f'  accepted={accepted}, metric={candidate_score:.6f}, '
+                      f'phase<={info["phase_bound"]:.4f} cycles, ratio={ratio:.3f}', flush=True)
+            
+            # Rejected because the real gain is smaller than expected, decrease the radius
             if not accepted:
-                tqdm.write('L-BFGS Armijo failed; keeping previous iterate')
-                t_trial = max(t_trial * 0.5, 1e-8)
-                tbar.set_postfix(metric=f'{metric.item():.6g}',
-                                 phase=f'{phase_max.item():.4f}',
-                                 status='armijo_fail')
+                radius *= 0.5
                 continue
-
-        new_loss, new_grad, new_metric = eval_with_grad()
-        new_phase = log_phase(raw.detach() * scale)
-
-        s = raw.detach().reshape(-1) - x0
-        y = new_grad - grad
-        sy = s.dot(y)
-        s_norm = s.norm().clamp_min(1e-12)
-        y_norm = y.norm().clamp_min(1e-12)
-        if sy > 1e-8 * s_norm * y_norm:
-            s_hist.append(s)
-            y_hist.append(y)
-            if len(s_hist) > history_size:
-                s_hist.pop(0)
-                y_hist.pop(0)
-
-        loss, grad = new_loss, new_grad
-        metric, phase_max = new_metric, new_phase
-        t_trial = min(lr, max(t * 1.5, 1e-8))
-        tbar.set_postfix(metric=f'{metric.item():.6g}', phase=f'{phase_max.item():.4f}')
-
-    F = (raw.detach() * scale)
-    return _report_dense_phase(F, phis_c, g_c, constrain, wrap)
-
-
-def lstsq_max_phase_wrap(A: torch.Tensor,
-                         b: torch.Tensor,
-                         phis: torch.Tensor,
-                         g_bases: torch.Tensor,
-                         max_phase_wrap: float = 1.0,
-                         n_admm: int = 50,
-                         rho: float = 1.0) -> torch.Tensor:
-    """
-    min_F ||A vec(F) - b||^2 with wrap caps on alphas and net phase.
-
-    ``A`` is ``(M, B*P)`` and ``F`` is row-major ``(B, P)``. SPH / temporal
-    bases are ill-conditioned, so capping only ``|phi^T F g|`` leaves a
-    kernel of huge cancelling ``F`` (and huge ``alpha = F g``) with small
-    net phase. This therefore enforces
-
-        |alpha_b(t)| * ||phi_b||_∞  <=  max_phase_wrap     for all b, t
-
-    by ADMM, then radially scales so ``max |phi^T alpha|`` also respects
-    the cap. ``max_phase_wrap=None`` or ``inf`` is plain least squares.
-    """
-    B = phis.shape[0]
-    P = g_bases.shape[0]
-    x = torch.linalg.lstsq(A, b).solution.reshape(B, P)
-    constrain = max_phase_wrap is not None and max_phase_wrap < float('inf')
-    if not constrain:
-        return x
-
-    g_flt = g_bases.reshape(P, -1).to(dtype=x.dtype)
-    phi_scale = _phi_inf(phis).to(dtype=x.dtype)
-    wrap_b = max_phase_wrap / phi_scale
-    alphas = x @ g_flt
-    alpha_ok = bool((alphas.abs() <= wrap_b[:, None] * (1 + 1e-5)).all())
-    if alpha_ok and _net_phase_max(x, phis, g_bases) <= max_phase_wrap:
-        return x
-
-    Gt = g_flt @ g_flt.T
-    gram_A = A.T @ A
-    CTC = torch.kron(torch.eye(B, dtype=x.dtype, device=x.device), Gt)
-    sA = gram_A.diag().mean().clamp_min(1e-12)
-    sC = CTC.diag().mean().clamp_min(1e-12)
-    rho_eff = rho * (sA / sC)
-    H = gram_A + rho_eff * CTC
-    H.diagonal().add_(1e-6 * sA)
-    Atb = A.T @ b
-
-    z = alphas.clamp(-wrap_b[:, None], wrap_b[:, None])
-    u = torch.zeros_like(z)
-    for _ in range(n_admm):
-        rhs = Atb + rho_eff * ((z - u) @ g_flt.T).reshape(-1)
-        x = torch.linalg.solve(H, rhs).reshape(B, P)
-        alphas = x @ g_flt
-        z = (alphas + u).clamp(-wrap_b[:, None], wrap_b[:, None])
-        u = u + alphas - z
-
-    over = (alphas.abs() / wrap_b[:, None]).amax(dim=1).clamp_min(1.0)
-    x = x / over[:, None]
-    phase_max = _net_phase_max(x, phis, g_bases)
-    if phase_max > max_phase_wrap:
-        x = x * (max_phase_wrap / phase_max.clamp_min(1e-12))
-    return x
+            
+            # Update the operating point
+            F_param, operator, image, score = candidate, candidate_operator, candidate_image, candidate_score
+            
+            # If the real gain is smaller than expected, decrease the radius
+            if ratio < 0.25:
+                radius *= 0.5
+            # If the real gain is limited by the phase boundary, increase the radius
+            elif ratio > 0.75 and info['stop_reason'] == 'phase_boundary':
+                radius = min(2 * radius, max_radius)
+                
+            # Exit the retry loop if the update was accepted
+            break
+        
+        # Exit the outer loop if the update was not accepted
+        if not accepted:
+            if verbose:
+                print(f'Outer {outer + 1} failed to accept update after {max_retries} retries', flush=True)
+            break
+    
+    # Return the final parameters, alphas, image, and score
+    F = F_param / phi_scale[:, None] / g_scale[None, :]
+    return dict(F=F.detach(), alphas=alphas_from(F_param).detach(), image=image.detach(),
+                initial_image=initial_image, initial_score=initial_score, final_score=score,
+                history=history)

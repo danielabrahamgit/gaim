@@ -17,13 +17,13 @@ from mr_recon.linops import sense_linop, batching_params
 from mr_recon.recons import CG_SENSE_recon
 from mr_recon.fourier import cufi_nufft
 
-from gaim.phase_expansions import girf_bases, polar_poly_fourier_bases, compress_bases
+from gaim.phase_expansions import girf_bases, polar_poly_fourier_bases, compress_bases, poly_time_bases
 
 from tqdm import tqdm
 import numpy as np
 from pathlib import Path
 
-dataset = 'tilt_spi'
+dataset = 'magnus_spi'
 
 # Load data
 torch_dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -64,24 +64,31 @@ alphas_start_zero = alphas_sph - alphas_sph[:, :1]
 # bases_flat = polar_poly_fourier_bases(trj, num_radial=15, num_angular=1, use_grad=True)
 # bases_flat = bases_flat.reshape((bases_flat.shape[0], -1)).T
 num_splines = 10
-max_freq_hz = 9e3
+max_freq_hz = 20e3
 bases, freq_hz, spline_fft = girf_bases(
     grad, dt, num_splines=num_splines, max_freq_hz=max_freq_hz, return_spectrum=True,
 )
 bases_flat = bases.reshape((bases.shape[0] * bases.shape[1], -1)).T
-bases_flat = compress_bases(bases_flat.T, num_bases=20).T
+# girf_only = True
+girf_only = False
+num_polys = 4
+bases_time = poly_time_bases(trj, num_polys=num_polys).reshape((num_polys, -1)).T
+bases_flat = torch.cat([bases_flat, bases_time], dim=-1)
+# bases_flat = bases_flat[:, :, None] * bases_time[:, None, :]
+# bases_flat = bases_flat.reshape((bases_flat.shape[0], -1))
+# bases_flat = compress_bases(bases_flat.T, num_bases=40).T
 print(f'bases_flat.shape: {bases_flat.shape}')
-# n_knot = bases.shape[-2]
-# n_axes = bases.shape[-1]
-# bases_flat = bases.reshape(-1, n_knot * n_axes)
 target = alphas_start_zero.reshape((16, -1)).T
 coeffs = torch.linalg.lstsq(bases_flat, target).solution
 alphas_fit = (bases_flat @ coeffs).T.reshape((16, *trj_size))
 # (2Q, D, 16) lstsq weights -> GIRF P_{s,d}(f), shape (16, D, F)
-# girf_fft = torch.einsum(
-#     'fqd,qds->sdf', spline_fft, coeffs.reshape(n_knot, n_axes, 16).to(spline_fft.dtype),
-# )
-# print(f'girf_fft.shape: {tuple(girf_fft.shape)}')
+if girf_only:
+    girf_fft = torch.einsum(
+        'fqd,qds->sdf', spline_fft, coeffs.reshape(num_splines*2, 2, 16).to(spline_fft.dtype),
+    )
+    print(f'girf_fft.shape: {tuple(girf_fft.shape)}')
+
+# # DEBUGING
 # alphas_fit = alphas_start_zero
 
 
@@ -95,7 +102,7 @@ phis = phis_new * mask
 # Remove empty bases
 phis, alphas = remove_empty_bases(phis, alphas)
 
-R = 2
+R = 1
 alphas = alphas[:, :, ::R].squeeze()
 dcf = dcf[:, ::R].squeeze()
 trj = trj[:, ::R].squeeze()
@@ -152,38 +159,40 @@ for b in range(16):
     # plt.xlim(18_000, 23_000)
 plt.tight_layout()
 
-# # GIRF transfer functions: magnitude and phase of each (SH, axis) entry
-# band = freq_hz <= max_freq_hz
-# freq_khz = freq_hz[band].detach().cpu().numpy() / 1e3
-# girf_band = girf_fft[:, :, band].detach().cpu().numpy()
-# axis_names = ['Gx', 'Gy', 'Gz'][:n_axes]
+# GIRF transfer functions: magnitude and phase of each (SH, axis) entry
+if girf_only:
+    n_axes = 2
+    band = freq_hz <= max_freq_hz
+    freq_khz = freq_hz[band].detach().cpu().numpy() / 1e3
+    girf_band = girf_fft[:, :, band].detach().cpu().numpy()
+    axis_names = ['Gx', 'Gy', 'Gz'][:n_axes]
 
-# fig_mag, axes_mag = plt.subplots(
-#     16, n_axes, figsize=(4 * n_axes, 24), sharex=True, sharey=False,
-#     squeeze=False, constrained_layout=True,
-# )
-# fig_mag.suptitle('GIRF magnitude')
-# fig_ph, axes_ph = plt.subplots(
-#     16, n_axes, figsize=(4 * n_axes, 24), sharex=True, sharey=False,
-#     squeeze=False, constrained_layout=True,
-# )
-# fig_ph.suptitle('GIRF phase')
-# for s in range(16):
-#     for d in range(n_axes):
-#         h = girf_band[s, d]
-#         axes_mag[s, d].plot(freq_khz, np.abs(h), color='C0', linewidth=1)
-#         axes_ph[s, d].plot(freq_khz, np.unwrap(np.angle(h)), color='C1', linewidth=1)
-#         if s == 0:
-#             axes_mag[s, d].set_title(axis_names[d])
-#             axes_ph[s, d].set_title(axis_names[d])
-#         if d == 0:
-#             axes_mag[s, d].set_ylabel(f'SH {s}')
-#             axes_ph[s, d].set_ylabel(f'SH {s}')
-#         axes_mag[s, d].grid(True, alpha=0.3)
-#         axes_ph[s, d].grid(True, alpha=0.3)
-# for d in range(n_axes):
-#     axes_mag[-1, d].set_xlabel('Frequency (kHz)')
-#     axes_ph[-1, d].set_xlabel('Frequency (kHz)')
+    fig_mag, axes_mag = plt.subplots(
+        16, n_axes, figsize=(4 * n_axes, 24), sharex=True, sharey=False,
+        squeeze=False, constrained_layout=True,
+    )
+    fig_mag.suptitle('GIRF magnitude')
+    fig_ph, axes_ph = plt.subplots(
+        16, n_axes, figsize=(4 * n_axes, 24), sharex=True, sharey=False,
+        squeeze=False, constrained_layout=True,
+    )
+    fig_ph.suptitle('GIRF phase')
+    for s in range(16):
+        for d in range(n_axes):
+            h = girf_band[s, d]
+            axes_mag[s, d].plot(freq_khz, np.abs(h), color='C0', linewidth=1)
+            axes_ph[s, d].plot(freq_khz, np.unwrap(np.angle(h)), color='C1', linewidth=1)
+            if s == 0:
+                axes_mag[s, d].set_title(axis_names[d])
+                axes_ph[s, d].set_title(axis_names[d])
+            if d == 0:
+                axes_mag[s, d].set_ylabel(f'SH {s}')
+                axes_ph[s, d].set_ylabel(f'SH {s}')
+            axes_mag[s, d].grid(True, alpha=0.3)
+            axes_ph[s, d].grid(True, alpha=0.3)
+    for d in range(n_axes):
+        axes_mag[-1, d].set_xlabel('Frequency (kHz)')
+        axes_ph[-1, d].set_xlabel('Frequency (kHz)')
 
 
 plt.show()

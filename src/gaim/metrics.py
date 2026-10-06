@@ -61,6 +61,56 @@ def _haar_details(mag: torch.Tensor, spatial_ndim: int):
         details.extend(bands[1:])
     return details
 
+def similarity_metric(img: torch.Tensor,
+                      img_ref: torch.Tensor,
+                      spatial_ndim: int = 2,
+                      eps: Optional[float] = 1e-12) -> torch.Tensor:
+    """
+    Similarity metric. Looks at the similarity between the image and the reference image.
+    """
+    mag = img.abs()
+    mag_ref = img_ref.abs()
+    spatial_dims = tuple(range(-spatial_ndim, 0))
+    # return (mag * mag_ref).sum(dim=spatial_dims) / (mag.square().sum(dim=spatial_dims) * mag_ref.square().sum(dim=spatial_dims)).clamp_min(eps)
+    return -(mag - mag_ref).norm(dim=spatial_dims) / (mag_ref.norm(dim=spatial_dims).clamp_min(eps))
+
+def mask_ratio_metric(img: torch.Tensor,
+                      mask: torch.Tensor,
+                      spatial_ndim: int = 2,
+                      eps: Optional[float] = 1e-12) -> torch.Tensor:
+    """
+    Background signal metric. Looks at energy in the background region 
+    """
+    mag = img.abs()
+    spatial_dims = tuple(range(-spatial_ndim, 0))
+    background_energy = (mag * (1 - mask)).square().sum(dim=spatial_dims)
+    image_energy = (mag * mask).square().sum(dim=spatial_dims)
+    return (image_energy / background_energy.clamp_min(eps)).sqrt()
+    
+
+def ghost_similarity_metric(img: torch.Tensor,
+                            shift_px: int,
+                            pe_dim: int = -1,
+                            spatial_ndim: int = 2,
+                            eps: Optional[float] = 1e-12):
+    mag = img.abs()
+    spatial_dims = tuple(range(-spatial_ndim, 0))
+    mag_shift = torch.roll(mag, shifts=shift_px, dims=pe_dim)
+    metric = (mag * mag_shift).sum(dim=spatial_dims)
+    return -metric / mag.square().sum(dim=spatial_dims).clamp_min(eps)
+
+    return (mag * shifted).sum() / power.sum().clamp_min(1e-20)
+
+def spatial_entropy_metric(img: torch.Tensor,
+                           spatial_ndim: int = 2,
+                           eps: Optional[float] = 1e-12) -> torch.Tensor:
+    """
+    Shannon entropy of the spatial-gradient magnitude.
+    """
+    mag = img.abs()
+    spatial_dims = tuple(range(-spatial_ndim, 0))
+    p = mag / mag.sum(dim=spatial_dims, keepdim=True).clamp_min(eps)
+    return (p * (p + eps).log()).sum(dim=spatial_dims)
 
 def gradient_entropy_metric(img: torch.Tensor,
                             spatial_ndim: int = 2,
