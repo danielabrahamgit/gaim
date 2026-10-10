@@ -78,7 +78,7 @@ def local_step(x0: torch.Tensor,
                metric: callable, 
                radius: float, 
                max_steps: int,
-               coefficient_penalty=None) -> tuple[torch.Tensor, dict]:
+               coefficient_penalty=None, full_jacobian=False) -> tuple[torch.Tensor, dict]:
     """
     L-BFGS ascent of the Taylor metric, stopping at the phase boundary.
     
@@ -98,6 +98,9 @@ def local_step(x0: torch.Tensor,
         The radius of the trust region.
     max_steps : int
         The maximum number of steps.
+    full_jacobian : bool
+        If True, responses has shape (B, P, *im_size) and contains the full
+        image Jacobian instead of separable temporal responses.
     coefficient_penalty : callable, optional
         Additional loss penalty(delta_F, Taylor_image), e.g. data consistency.
         
@@ -112,9 +115,13 @@ def local_step(x0: torch.Tensor,
 
     # Loss function eval using taylor model
     def loss(F):
-        # Contract in this order to avoid storing B*P full derivative images.
-        change = (F.to(responses.dtype) @ responses.flatten(1)).reshape_as(phis)
-        image = x0 + (phis * change).sum(0)
+        if full_jacobian:
+            image = x0 + (F.flatten().to(responses.dtype) @
+                          responses.reshape(F.numel(), -1)).reshape_as(x0)
+        else:
+            # Preserve the separable model without B*P derivative images.
+            change = (F.to(responses.dtype) @ responses.flatten(1)).reshape_as(phis)
+            image = x0 + (phis * change).sum(0)
         value = -metric(image)
         if coefficient_penalty is not None:
             value = value + coefficient_penalty(F, image)
@@ -188,7 +195,8 @@ def taylor_trust(phis: torch.Tensor,
                  metric: callable=gradient_entropy_metric,
                  F_init: Optional[torch.Tensor] = None,
                  outer_steps=30, inner_steps=25, radius=0.1, max_radius=1,
-                 P_batch_size=1, max_retries=4, verbose=True):
+                 P_batch_size=1, max_retries=4, verbose=True, *,
+                 _response_builder=None):
     """
     Iteratively builds a taylor expansion around the current operating point, then 
     optimizes the taylor model using local_step. Rejects inaccurate predictions and 
@@ -265,7 +273,7 @@ def taylor_trust(phis: torch.Tensor,
     if F_init is None:
         F_param = torch.zeros(B, P, dtype=phis.dtype, device=phis.device)
     else:
-        F_param = F_init / phi_scale[:, None] / g_scale[None, :]
+        F_param = F_init * phi_scale[:, None] * g_scale[None, :]
 
     # Gets alphas from F 
     def alphas_from(F):
@@ -284,16 +292,21 @@ def taylor_trust(phis: torch.Tensor,
     history = []
     for outer in tqdm(range(outer_steps), desc='Outer steps', disable=not verbose):
         
-        # Build P responses for the current operating point
-        print(f'Building responses for P = {P}')
+        # Build image responses at the current operating point.
+        if verbose:
+            count = B * P if _response_builder is not None else P
+            print(f'Building {count} image responses', flush=True)
         with torch.no_grad():
-            if P_batch_size == 1:
+            if _response_builder is not None:
+                responses = _response_builder(operator, image, phi, g)
+            elif P_batch_size == 1:
                 responses = torch.stack([recon(operator, ksp * (2j * torch.pi * gp)) for gp in g])
             else:
                 responses = []
                 for p1 in range(0, P, P_batch_size):
                     p2 = min(p1 + P_batch_size, P)
-                    responses.append(recon(operator, ksp[None,] * (2j * torch.pi * g[p1:p2, None,])))
+                    tup = (slice(p1, p2),) + (None,) * (1 + ksp.ndim - g.ndim)
+                    responses.append(recon(operator, ksp[None,] * (2j * torch.pi * g[tup])))
                 responses = torch.cat(responses, dim=0)
         
         # Now we will see if the taylor model is accurate enough to accept the update
@@ -301,7 +314,8 @@ def taylor_trust(phis: torch.Tensor,
         for retry in range(max_retries):
             
             # Optimize the taylor model with L-BFGS
-            delta_F, info = local_step(image, responses, phi, g, metric, radius, inner_steps)
+            delta_F, info = local_step(image, responses, phi, g, metric, radius, inner_steps,
+                                          full_jacobian=_response_builder is not None)
             
             # Convergence check
             if info['predicted_gain'] <= 1e-8:
@@ -353,3 +367,121 @@ def taylor_trust(phis: torch.Tensor,
     return dict(F=F.detach(), alphas=alphas_from(F_param).detach(), image=image.detach(),
                 initial_image=initial_image, initial_score=initial_score, final_score=score,
                 history=history)
+
+
+@torch.no_grad()
+def _implicit_cg(normal, rhs, initial=None, max_iter=100, tolerance=1e-4):
+    """Solve a Hermitian positive-definite system, checking the true residual."""
+    x = torch.zeros_like(rhs) if initial is None else initial.clone()
+    scale = rhs.norm()
+    if scale == 0:
+        return torch.zeros_like(rhs)
+    r = rhs - normal(x)
+    p = r.clone()
+    rr = torch.vdot(r.flatten(), r.flatten()).real
+    for _ in range(max_iter):
+        if r.norm() <= tolerance * scale:
+            # Recursive CG residuals can drift, especially in complex64.
+            r = rhs - normal(x)
+            if r.norm() <= tolerance * scale:
+                return x
+            p = r.clone()
+            rr = torch.vdot(r.flatten(), r.flatten()).real
+        Hp = normal(p)
+        curvature = torch.vdot(p.flatten(), Hp.flatten()).real
+        if not torch.isfinite(curvature) or curvature <= 0:
+            raise RuntimeError('Implicit CG requires a positive-definite normal operator')
+        step = rr / curvature
+        x += step * p
+        r -= step * Hp
+        rr_new = torch.vdot(r.flatten(), r.flatten()).real
+        p = r + (rr_new / rr) * p
+        rr = rr_new
+    relative_residual = ((rhs - normal(x)).norm() / scale).item()
+    if not relative_residual <= tolerance:
+        raise RuntimeError(f'Implicit CG did not converge: relative residual '
+                           f'{relative_residual:.3g} > {tolerance:.3g}; increase '
+                           'cg_max_iter or regularization, or relax cg_tolerance')
+    return x
+
+
+@torch.no_grad()
+def implicit_image_recon(operator, ksp, *, regularization=1e-3,
+                         cg_max_iter=100, cg_tolerance=1e-4, initial=None):
+    """Solve ||W**(1/2)(Ax-y)||² + regularization*||x||².
+
+    operator.forward is A; operator.adjoint MUST be A^H W for fixed real
+    diagonal W (or the true adjoint for W=I). HOFFT uses its dcf as W.
+    Use explicit forward/adjoint products rather than a cached normal.
+    regularization is an absolute coefficient, not scaled by an eigenvalue.
+    """
+    if not regularization > 0 or cg_max_iter < 1 or not 0 < cg_tolerance < 1:
+        raise ValueError('Positive regularization/iterations and 0 < tolerance < 1 required')
+    normal = lambda x: operator.adjoint(operator.forward(x)) + regularization * x
+    return _implicit_cg(normal, operator.adjoint(ksp), initial,
+                        cg_max_iter, cg_tolerance)
+
+
+@torch.no_grad()
+def _implicit_responses(operator, image, ksp, phis, bases, *,
+                        regularization, cg_max_iter, cg_tolerance):
+    """J[b,p] solves H J = dA^H W(y-Ax) - A^H W dA x.
+
+    Assumes real phis/bases and encoding exp(-2j*pi*phi^T F g).
+    dA_bp = -2j*pi*M_g[p]*A*M_phi[b]. Spatial/temporal multipliers
+    broadcast over image/k-space dimensions; diagonal W commutes with M_g.
+    """
+    normal = lambda x: operator.adjoint(operator.forward(x)) + regularization * x
+    residual = ksp - operator.forward(image)
+    residual_responses = torch.stack([operator.adjoint(g * residual) for g in bases])
+    responses = image.new_empty(len(phis), len(bases), *image.shape)
+    for b, phi in enumerate(phis):
+        encoded = operator.forward(phi * image)
+        for p, g in enumerate(bases):
+            rhs = 2j * torch.pi * (phi * residual_responses[p]
+                                  + operator.adjoint(g * encoded))
+            responses[b, p] = _implicit_cg(normal, rhs, max_iter=cg_max_iter,
+                                           tolerance=cg_tolerance)
+    return responses
+
+
+def taylor_implicit_trust(phis, bases, ksp, build_linop, recon=None,
+                          metric=gradient_entropy_metric, F_init=None,
+                          outer_steps=30, inner_steps=25, radius=0.1,
+                          max_radius=1, P_batch_size=1, max_retries=4,
+                          verbose=True, *, regularization=1e-3,
+                          cg_max_iter=100, cg_tolerance=1e-4):
+    """Taylor trust-region calibration using implicit image derivatives.
+
+    Mirrors taylor_trust's arguments and result. Every base/trial image solves
+    the same ridge-regularized weighted least-squares problem; optional recon
+    provides only an initial guess, which is refined to cg_tolerance. Failed
+    image or derivative solves raise rather than silently using a bad model.
+
+    The operator must encode exp(-2j*pi*phi^T F g), with forward=A and
+    adjoint=A^H W for fixed nonnegative diagonal W. phis/bases must be real.
+    No differentiation through build_linop is needed. For approximate encoding
+    implementations these are derivatives of the physical phase model.
+
+    Caches B*P complex derivative images, unlike taylor_trust's P images.
+    P_batch_size is retained for call compatibility; solves run sequentially.
+    Use implicit_image_recon with the same settings for reference images.
+    """
+    if phis.is_complex() or bases.is_complex():
+        raise ValueError('Implicit phase derivatives require real phis and bases')
+    if P_batch_size < 1:
+        raise ValueError('P_batch_size must be positive')
+    settings = dict(regularization=regularization, cg_max_iter=cg_max_iter,
+                    cg_tolerance=cg_tolerance)
+
+    def reconstruct(operator, data):
+        initial = None if recon is None else recon(operator, data)
+        return implicit_image_recon(operator, data, initial=initial, **settings)
+
+    def responses(operator, image, phi, g):
+        return _implicit_responses(operator, image, ksp, phi, g, **settings)
+
+    return taylor_trust(phis, bases, ksp, build_linop, reconstruct, metric,
+                        F_init, outer_steps, inner_steps, radius, max_radius,
+                        P_batch_size, max_retries, verbose,
+                        _response_builder=responses)
